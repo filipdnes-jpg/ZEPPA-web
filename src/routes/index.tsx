@@ -90,15 +90,11 @@ function Index() {
               <div className="inline-flex items-center gap-2 rounded-full glass px-4 py-1.5 text-xs uppercase tracking-widest text-brand-glow">
                 <Sparkles className="h-3.5 w-3.5" /> Bezpečnosť na profesionálnej úrovni
               </div>
-            <Reveal delay={100}>
-  <h1 className="mt-6 text-4xl sm:text-5xl md:text-6xl lg:text-7xl font-bold leading-tight">
-    <span className="text-brand-glow">ZEPPA:</span>{" "}
-    Váš partner pre{" "}
-    <span className="text-brand-glow">
-      elektroinštalácie a bezpečnosť
-    </span>
-  </h1>
-</Reveal>
+           <Reveal delay={100}>
+            <h1 className="mt-6 text-5xl md:text-6xl lg:text-7xl font-bold leading-[1.05]">
+                <span className="text-brand-glow">ZEPPA:</span>&nbsp;Váš partner pre&nbsp;<span className="text-brand-glow">elektroištalácie a bezpečnosť</span>
+            </h1>
+            </Reveal>
             <Reveal delay={100}>
             <h1 className="mt-6 text-5xl md:text-6xl lg:text-7xl font-bold leading-[1.05]">
                 <span className="text-brand-glow">ZEPPA:</span>&nbsp;Váš partner pre&nbsp;<span className="text-brand-glow">elektroištalácie a bezpečnosť</span>
