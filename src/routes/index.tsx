@@ -91,8 +91,7 @@ function Index() {
                 <Sparkles className="h-3.5 w-3.5" /> Bezpečnosť na profesionálnej úrovni
               </div>
            <Reveal delay={100}>
-            <Reveal delay={100}>
-             <h1 className="mt-6 text-4xl sm:text-5xl md:text-6xl lg:text-7xl font-bold leading-tight">
+             <h1> className="mt-6 text-4xl sm:text-5xl md:text-6xl lg:text-7xl font-bold leading-tight">
             <span className="text-brand-glow">ZEPPA:</span>{" "}
             Váš partner pre{" "}
             <span className="text-brand-glow">
