@@ -1105,6 +1105,9 @@ function createReelFlux(root, initial) {
   function step(direction) { target = (Math.round(target / stride) + direction) * stride; wake(); }
   listen(root, 'wheel', (event) => {
     if (config.preview || config.wheel === 'off') return;
+    // Zeppa: trackpads send a little sideways motion while scrolling the page vertically;
+    // in horizontal mode only a clearly sideways gesture moves the reel, everything else scrolls the page.
+    if (config.wheel === 'horizontal' && Math.abs(event.deltaX) <= Math.abs(event.deltaY) * 1.2) return;
     const delta = config.wheel === 'horizontal' ? event.deltaX : Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
     if (!delta) return; event.preventDefault();
     const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? width : 1;
