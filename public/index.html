@@ -947,11 +947,137 @@ const waves=mountWaves(wavesCanvas,{"plum":"#171717","rose":"#2a2a2a","peach":"#
 window.addEventListener('pagehide',()=>waves.destroy(),{once:true});
 </script>
 <script type="module">
+// Zeppa: GPU renderer for the Reel Flux gallery. It draws the same picture as the
+// original strip-sampling canvas renderer (edge flare, smear, wave and spectral rim),
+// but as one full-screen quad in a fragment shader, so it costs the same few
+// milliseconds on any machine instead of hundreds of drawImage calls per frame.
+function createReelGL(canvas) {
+  let gl = null;
+  try { gl = canvas.getContext('webgl', { alpha: true, premultipliedAlpha: true, antialias: false, powerPreference: 'default' }); } catch (e) { gl = null; }
+  if (!gl) return null;
+  const hp = gl.getShaderPrecisionFormat && gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER, gl.HIGH_FLOAT);
+  if (!hp || hp.precision < 16) return null;
+  const vs = 'attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}';
+  const fs = `precision highp float;
+uniform sampler2D atlas;
+uniform vec2 res;        // css px
+uniform float dpr;
+uniform vec4 layout;     // origin (mod loop), stride, card, cardHeight
+uniform vec4 fx;         // zone, smear, growth, wave
+uniform vec4 misc;       // phaseOffset, frequency, fringe, count
+uniform vec4 cell;       // cols, rows, cellW, cellH (px)
+uniform vec2 atlasSize;
+float bellLin(float x){ return fx.x>0. ? max(0.,(fx.x-min(x,res.x-x))/fx.x) : 0.; }
+float warp(float x){
+  float z=fx.x, s=fx.y;
+  if(z<=0.) return x;
+  if(x<z){ float d=z-x; return x + s*d*d*d/(3.*z*z); }
+  if(x>res.x-z){ float d=x-res.x+z; return x - s*d*d*d/(3.*z*z); }
+  return x;
+}
+vec4 over(vec4 top, vec4 base){ return top + base*(1.-top.a); }
+float rimAlpha(float t, float f){ return t<.35 ? mix(0.,.5*f,t/.35) : mix(.5*f,f,(t-.35)/.65); }
+void main(){
+  float x = gl_FragCoord.x/dpr;
+  float y = (res.y*dpr - gl_FragCoord.y)/dpr;
+  float t = bellLin(x), k = t*t;
+  float u = warp(x);
+  float slot = floor((u-layout.x)/layout.y);
+  float lx = u-layout.x-slot*layout.y;
+  float card = layout.z;
+  vec4 col = vec4(0.);
+  if(lx < card){
+    float phase = x/res.x*6.2831853*misc.y + misc.x;
+    float w = fx.w;
+    float h = layout.w*(1.+k*fx.z)*(1.+cos(phase)*abs(w)/res.y*.150001);
+    float y0 = (res.y-h)/2. + sin(phase)*w;
+    float px = 1./dpr;
+    // image
+    float ax = clamp((card-lx)/px,0.,1.)*clamp(lx/px+.5,0.,1.);
+    float ay = clamp((y-y0)/px+.5,0.,1.)*clamp((y0+h-y)/px+.5,0.,1.);
+    if(ax*ay>0.){
+      float idx = mod(slot, misc.w);
+      float cx = mod(idx, cell.x), cy = floor(idx/cell.x);
+      vec2 uv = vec2(clamp(lx/card,0.,1.), clamp((y-y0)/h,0.,1.));
+      vec2 inCell = .5 + uv*(cell.zw-1.);
+      vec4 img = texture2D(atlas, (vec2(cx,cy)*cell.zw + inCell)/atlasSize);
+      col = vec4(img.rgb,1.)*(ax*ay);
+    }
+    // spectral rim on the flared edges (cool outer line, warm inner line)
+    if(misc.z>0. && k>0.){
+      float a1 = rimAlpha(t, misc.z), a2 = a1;
+      float dTop = abs(y-(y0-1.5)), dBot = abs(y-(y0+h+1.5));
+      float c1 = clamp(1.5+.5*px-min(dTop,dBot),0.,px)/px * a1;
+      col = over(vec4(vec3(79.,168.,255.)/255.*c1,c1), col);
+      float wTop = abs(y-(y0+1.)), wBot = abs(y-(y0+h-1.));
+      float c2 = clamp(1.+.5*px-min(wTop,wBot),0.,px)/px * a2;
+      col = over(vec4(vec3(255.,179.,71.)/255.*c2,c2), col);
+    }
+  }
+  gl_FragColor = col;
+}`;
+  const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; };
+  let prog;
+  try {
+    prog = gl.createProgram(); gl.attachShader(prog, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error('link');
+  } catch (e) { return null; }
+  gl.useProgram(prog);
+  const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(prog, 'p'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  const U = {}; for (const n of ['atlas','res','dpr','layout','fx','misc','cell','atlasSize']) U[n] = gl.getUniformLocation(prog, n);
+  const tex = gl.createTexture();
+  let atlasReady = false, pending = null, count = 1, cols = 2, rows = 1, cw = 1, ch = 1, aw = 1, ah = 1;
+  function setImages(images, aspect) { atlasReady = false; pending = { images, aspect }; }
+  function build() {
+    if (!pending) return atlasReady;
+    const { images, aspect } = pending;
+    if (!images.length || !images.every((im) => im.complete && im.naturalWidth)) return false;
+    const max = Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE) || 2048, 4096);
+    count = images.length; cols = 2; rows = Math.ceil(count / cols);
+    cw = Math.min(1024, Math.floor(max / cols)); ch = Math.round(cw / aspect);
+    if (ch * rows > max) { ch = Math.floor(max / rows); cw = Math.round(ch * aspect); }
+    aw = cw * cols; ah = ch * rows;
+    const c = document.createElement('canvas'); c.width = aw; c.height = ah; const x = c.getContext('2d');
+    images.forEach((im, i) => {
+      const s = Math.max(cw / im.naturalWidth, ch / im.naturalHeight), sw = cw / s, sh2 = ch / s;
+      x.drawImage(im, (im.naturalWidth - sw) / 2, (im.naturalHeight - sh2) / 2, sw, sh2, (i % cols) * cw, Math.floor(i / cols) * ch, cw, ch);
+    });
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    pending = null; atlasReady = true; return true;
+  }
+  function draw(s) {
+    if (gl.isContextLost() || !build()) return false;
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(prog);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(U.atlas, 0);
+    gl.uniform2f(U.res, s.width, s.height); gl.uniform1f(U.dpr, s.dpr);
+    gl.uniform4f(U.layout, s.origin, s.stride, s.card, s.cardHeight);
+    gl.uniform4f(U.fx, s.zone, s.smear, s.growth, s.wave);
+    gl.uniform4f(U.misc, s.phaseOffset, s.frequency, s.fringe, count);
+    gl.uniform4f(U.cell, cols, rows, cw, ch); gl.uniform2f(U.atlasSize, aw, ah);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    return true;
+  }
+  return { setImages, draw };
+}
+
 // Original HorizonX code. Visual inspiration: https://saurow-reel.vercel.app
 // Default artwork generated for HorizonX. HorizonX Tools License.
 /** Original HorizonX strip-sampling renderer. No third-party shader or engine. */
 function createReelFlux(root, initial) {
-  const canvas = root.querySelector('.rf-canvas'), ctx = canvas.getContext('2d');
+  const canvas = root.querySelector('.rf-canvas');
+  // Zeppa: draw on the GPU when WebGL is available; fall back to the original canvas renderer.
+  const glr = createReelGL(canvas), ctx = glr ? null : canvas.getContext('2d');
+  let pxr = 1;
   const live = root.querySelector('.rf-live'), fallback = root.querySelector('.rf-fallback');
   let config = initial, width = 1, height = 1, card = 1, stride = 1;
   let images = [], sources = [], position = 0, target = 0, last = 0, frame = 0;
@@ -964,7 +1090,7 @@ function createReelFlux(root, initial) {
   const fallbackImages = (urls) => fallback.replaceChildren(...urls.map((src, i) => {
     const image = document.createElement('img'); image.src = src; image.alt = `Ilustračný obrázok ${i + 1}`; image.draggable = false; image.setAttribute('role', 'listitem'); return image;
   }));
-  if (!ctx) {
+  if (!ctx && !glr) {
     const scroll = (direction) => fallback.scrollBy({ left: direction * root.clientWidth * .6, behavior: motion.matches ? 'instant' : 'smooth' });
     listen(root.querySelector('.rf-prev'), 'click', () => scroll(-1));
     listen(root.querySelector('.rf-next'), 'click', () => scroll(1));
@@ -980,9 +1106,11 @@ function createReelFlux(root, initial) {
     const oldStride = stride;
     card = Math.min(width * (width < 600 ? Math.max(.820001, config.cardWidth / 100) : config.cardWidth / 100), height * .719999 * config.aspect);
     stride = card + config.gap; position *= stride / oldStride; target *= stride / oldStride;
-    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    let dpr = Math.min(window.devicePixelRatio || 1, glr ? 2 : 1.5);
+    if (glr) dpr = Math.max(1, Math.min(dpr, Math.sqrt(3_200_000 / (width * height))));
+    pxr = dpr;
     canvas.width = Math.ceil(width * dpr); canvas.height = Math.ceil(height * dpr);
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); wake();
+    if (ctx) ctx.setTransform(dpr, 0, 0, dpr, 0, 0); wake();
   }
   function setImages() {
     if (JSON.stringify(sources) === JSON.stringify(config.images)) return;
@@ -993,6 +1121,7 @@ function createReelFlux(root, initial) {
       image.onload = image.onerror = () => { if (!destroyed) wake(); };
       image.src = src; return image;
     });
+    if (glr) glr.setImages(images, config.aspect);
     position = mod(position / stride, images.length) * stride; target = position; active = -1;
   }
   function announce() {
@@ -1011,7 +1140,7 @@ function createReelFlux(root, initial) {
     const loop = images.length * stride;
     // Rebase to keep long-running autoplay precise without changing the picture.
     if (Math.abs(position) > loop * 50) { const cycles = Math.trunc(position / loop) * loop; position -= cycles; target -= cycles; }
-    ctx.clearRect(0, 0, width, height);
+    if (ctx) ctx.clearRect(0, 0, width, height);
     const cardHeight = card / config.aspect, origin = width / 2 - card / 2 - position;
     // Edge zones: cards flare taller, stretch into streaks and pick up a colour
     // rim as they enter and leave the stage. Layout runs in a warped space whose
@@ -1025,6 +1154,14 @@ function createReelFlux(root, initial) {
     // A narrow zone gets a gentler flare and finer strips, so the curve cannot
     // climb in visible steps.
     const growth = config.flare * .900001 * Math.min(1, zone / (cardHeight * .5)), pitch = 3;
+    if (glr) {
+      const painted = glr.draw({ width, height, dpr: pxr, origin: mod(origin, loop), stride, card, cardHeight, zone, smear, growth, wave,
+        phaseOffset: mod(position / width * 1.5, Math.PI * 2), frequency: config.frequency, fringe: config.fringe });
+      root.toggleAttribute('data-ready', painted);
+      if (Math.abs(target - position) < .500001 && !dragging) announce();
+      if (!painted || dragging || Math.abs(target - position) > .0499999 || Math.abs(wave) > .0500001 || (!motion.matches && config.autoplay > 0)) wake();
+      return;
+    }
     const bell = (x) => { const k = Math.max(0, (zone - Math.min(x, width - x)) / zone); return zone ? k * k : 0; };
     const warp = (x) => {
       if (x < zone) return x + smear * (zone - x) ** 3 / (3 * zone * zone);
